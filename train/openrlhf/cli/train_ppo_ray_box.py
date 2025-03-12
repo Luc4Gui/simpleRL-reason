@@ -310,6 +310,13 @@ if __name__ == "__main__":
         default="gae",
         help="Choose advantage estimation method: gae, reinforce",
     )
+    parser.add_argument(
+        "--use_curriculum_learning",
+        action="store_true",
+        default=False,
+        help=("use_curriculum_learning"),
+    )
+    
 
     #  Models
     parser.add_argument("--pretrain", type=str, default=None, help="HF model name or path")

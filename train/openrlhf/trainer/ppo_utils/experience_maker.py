@@ -24,6 +24,65 @@ from openrlhf.trainer.ppo_utils.qwen_math_eval_toolkit.parser import extract_ans
 logger = init_logger(__name__)
 
 import re
+def compute_rewards_mask(rewards, response_length, n_samples_per_prompt=8, beta=0.5, lamda=0.1):
+    """
+    """
+    # 初始化结果张量，和 rewards 形状相同
+    weights = torch.ones_like(rewards, device=rewards.device)  
+    # 遍历每一行
+    correct_score = 1.01
+    p = 0.5 # acc下限
+    for i in range(rewards.shape[0]):
+        # 获取当前行的 rewards 和 response_length
+        reward_row = rewards[i]
+        response_row = response_length[i]  
+        # 筛选出 reward 为 1 和 0 的 response_length
+        response_reward_1 = response_row[reward_row > correct_score]
+        response_reward_not_1 = response_row[(reward_row <= correct_score) & (response_row < 4094)]
+        # response_reward_1 = response_row[reward_row == 1.0]
+        # response_reward_not_1 = response_row[reward_row == 0.1]  
+        # 计算均值
+        mean_reward_1 = response_reward_1.max() if response_reward_1.numel() > 0 else float('-inf')
+        mean_reward_not_1 = response_reward_not_1.mean() if response_reward_not_1.numel() > 0 else float('inf')
+        min_reward_not_1 = response_reward_not_1.min() if response_reward_not_1.numel() > 0 else float('inf')  
+        # 判断均值关系并设置结果
+        if (mean_reward_1 > mean_reward_not_1) or response_reward_1.numel() == 0:
+            # 难题 < acc下限
+            if len(response_reward_1) < n_samples_per_prompt * p:
+                # 计算长度的最大值和最小值用于归一化
+                max_len = response_reward_1.max()
+                min_len = response_reward_1.min()
+                len_range = max_len - min_len
+                # 遍历每个reward为1的样本
+                for j in range(rewards.shape[1]):
+                    if rewards[i][j] >= correct_score:
+                        # 对长度进行归一化,并在基础reward上加减0.5
+                        base_reward = rewards[i][j]
+                        norm_len = (response_row[j] - min_len) / len_range
+                        # 长度越短reward越高,在基础reward上最多加减0.5
+                        rewards[i][j] = base_reward + beta * (2 * norm_len - 1) # + [-0.5, 0.5]
+            if len(response_reward_1) >= n_samples_per_prompt * (1 - p):
+                # 简单题 >= 1 - acc下限
+                # 计算长度的最大值和最小值用于归一化
+                max_len = response_reward_1.max()
+                min_len = response_reward_1.min()
+                len_range = max_len - min_len
+                # 遍历每个reward为1的样本
+                for j in range(rewards.shape[1]):
+                    if rewards[i][j] >= correct_score:
+                        # 对长度进行归一化,并在基础reward上加减0.5
+                        base_reward = rewards[i][j]
+                        norm_len = (response_row[j] - min_len) / len_range
+                        # 长度越短reward越高,在基础reward上最多加减0.5
+                        rewards[i][j] = base_reward - beta * (2 * norm_len - 1)
+            # weights[i][response_row > mean_reward_not_1] = 1.0
+            # weights[i][response_row <= mean_reward_not_1] = 0.1
+            weights[i] = 1.0
+        else:
+            # weights[i] = 0.1*(1-acc) if acc != 1 else 0.01
+            weights[i] = 0.1
+    return weights  
+
 def preprocess_orm800k_response(sequence):
     temp_query = ""
     temp_response = ""
@@ -1038,6 +1097,18 @@ class NaiveExperienceMaker(ABC):
     @torch.no_grad()
     def process_experiences(self, experiences: List[Experience]) -> List[Experience]:
         # TODO: add more methods to process experiences
+        args = self.strategy.args
+        if args.use_curriculum_learning:
+            rewards = torch.cat([experience.info["reward"] for experience in experiences])
+            rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            response_lengths = torch.cat([experience.info["response_length"] for experience in experiences])
+            response_lengths = response_lengths.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            weights = compute_rewards_mask(rewards, response_lengths, args.n_samples_per_prompt)
+            # rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+            rewards = rewards * weights
+            rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
+            for i in range(len(experiences)):
+                experiences[i].info["reward"] = rewards[i]
         return experiences
 
     @torch.no_grad()
@@ -1244,6 +1315,7 @@ class NaiveExperienceMakerORM(ABC):
                     generate_kwargs["gamma"],
                 )
                 experience.advantages = deepcopy(experience.returns)
+            
             else:
                 raise Exception(f"Unkown advantage_estimator {self.advantage_estimator}")
 
@@ -1417,6 +1489,18 @@ class NaiveExperienceMakerORM(ABC):
     @torch.no_grad()
     def process_experiences(self, experiences: List[Experience]) -> List[Experience]:
         # TODO: add more methods to process experiences
+        args = self.strategy.args
+        if args.use_curriculum_learning:
+            rewards = torch.cat([experience.info["reward"] for experience in experiences])
+            rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            response_lengths = torch.cat([experience.info["response_length"] for experience in experiences])
+            response_lengths = response_lengths.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            weights = compute_rewards_mask(rewards, response_lengths, args.n_samples_per_prompt)
+            # rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+            rewards = rewards * weights
+            rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
+            for i in range(len(experiences)):
+                experiences[i].info["reward"] = rewards[i]
         return experiences
 
     @torch.no_grad()
@@ -1624,6 +1708,7 @@ class NaiveExperienceMakerORM800K(ABC):
                     generate_kwargs["gamma"],
                 )
                 experience.advantages = deepcopy(experience.returns)
+            
             else:
                 raise Exception(f"Unkown advantage_estimator {self.advantage_estimator}")
 
@@ -1812,6 +1897,18 @@ class NaiveExperienceMakerORM800K(ABC):
     @torch.no_grad()
     def process_experiences(self, experiences: List[Experience]) -> List[Experience]:
         # TODO: add more methods to process experiences
+        args = self.strategy.args
+        if args.use_curriculum_learning:
+            rewards = torch.cat([experience.info["reward"] for experience in experiences])
+            rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            response_lengths = torch.cat([experience.info["response_length"] for experience in experiences])
+            response_lengths = response_lengths.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            weights = compute_rewards_mask(rewards, response_lengths, args.n_samples_per_prompt)
+            # rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+            rewards = rewards * weights
+            rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
+            for i in range(len(experiences)):
+                experiences[i].info["reward"] = rewards[i]
         return experiences
 
     @torch.no_grad()
@@ -2033,6 +2130,7 @@ class NaiveExperienceMakerPRM800K(ABC):
                     generate_kwargs["gamma"],
                 )
                 experience.advantages = deepcopy(experience.returns)
+            
             else:
                 raise Exception(f"Unkown advantage_estimator {self.advantage_estimator}")
 
@@ -2297,6 +2395,18 @@ class NaiveExperienceMakerPRM800K(ABC):
     @torch.no_grad()
     def process_experiences(self, experiences: List[Experience]) -> List[Experience]:
         # TODO: add more methods to process experiences
+        args = self.strategy.args
+        if args.use_curriculum_learning:
+            rewards = torch.cat([experience.info["reward"] for experience in experiences])
+            rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            response_lengths = torch.cat([experience.info["response_length"] for experience in experiences])
+            response_lengths = response_lengths.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            weights = compute_rewards_mask(rewards, response_lengths, args.n_samples_per_prompt)
+            # rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+            rewards = rewards * weights
+            rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
+            for i in range(len(experiences)):
+                experiences[i].info["reward"] = rewards[i]
         return experiences
 
     @torch.no_grad()
@@ -2533,6 +2643,7 @@ class NaiveExperienceMakerPRM800K_BOX(ABC):
                     generate_kwargs["gamma"],
                 )
                 experience.advantages = deepcopy(experience.returns)
+            
             else:
                 raise Exception(f"Unkown advantage_estimator {self.advantage_estimator}")
 
@@ -2776,6 +2887,18 @@ class NaiveExperienceMakerPRM800K_BOX(ABC):
     @torch.no_grad()
     def process_experiences(self, experiences: List[Experience]) -> List[Experience]:
         # TODO: add more methods to process experiences
+        args = self.strategy.args
+        if args.use_curriculum_learning:
+            rewards = torch.cat([experience.info["reward"] for experience in experiences])
+            rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            response_lengths = torch.cat([experience.info["response_length"] for experience in experiences])
+            response_lengths = response_lengths.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            weights = compute_rewards_mask(rewards, response_lengths, args.n_samples_per_prompt)
+            # rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+            rewards = rewards * weights
+            rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
+            for i in range(len(experiences)):
+                experiences[i].info["reward"] = rewards[i]
         return experiences
 
     @torch.no_grad()
@@ -2994,6 +3117,7 @@ class NaiveExperienceMakerBOX(ABC):
                     generate_kwargs["gamma"],
                 )
                 experience.advantages = deepcopy(experience.returns)
+            
             else:
                 raise Exception(f"Unkown advantage_estimator {self.advantage_estimator}")
 
@@ -3237,6 +3361,18 @@ class NaiveExperienceMakerBOX(ABC):
     @torch.no_grad()
     def process_experiences(self, experiences: List[Experience]) -> List[Experience]:
         # TODO: add more methods to process experiences
+        args = self.strategy.args
+        if args.use_curriculum_learning:
+            rewards = torch.cat([experience.info["reward"] for experience in experiences])
+            rewards = rewards.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            response_lengths = torch.cat([experience.info["response_length"] for experience in experiences])
+            response_lengths = response_lengths.reshape(-1, args.n_samples_per_prompt).to(device="cuda")
+            weights = compute_rewards_mask(rewards, response_lengths, args.n_samples_per_prompt)
+            # rewards = (rewards - rewards.mean(-1, keepdim=True)) / (rewards.std(-1, keepdim=True) + 1e-9)
+            rewards = rewards * weights
+            rewards = rewards.reshape(-1).to(device="cpu").chunk(len(experiences))
+            for i in range(len(experiences)):
+                experiences[i].info["reward"] = rewards[i]
         return experiences
 
     @torch.no_grad()

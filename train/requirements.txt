@@ -1,21 +1,22 @@
 accelerate
 bitsandbytes
 datasets
-deepspeed==0.15.0
+# deepspeed==0.15.0
 einops
-flash-attn==2.6.1
+# flash-attn==2.6.1
 isort
 jsonlines
 loralib
 optimum
 packaging
 peft
-ray[default]==2.12.0
+# ray[default]==2.12.0
 tensorboard
 torch
 torchmetrics
 tqdm
-transformers==4.46.1
+# transformers==4.46.1
 transformers_stream_generator
 wandb
 wheel
+word2number
